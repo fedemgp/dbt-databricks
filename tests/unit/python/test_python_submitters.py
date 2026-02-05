@@ -87,6 +87,33 @@ class TestPythonCommandSubmitter:
         client.command_contexts.destroy.assert_called_once_with(cluster_id, context_id)
         tracker.remove_command.assert_called_once_with(command_exec)
 
+    def test_submit__with_packages(self, client, tracker, cluster_id, context_id, compiled_code):
+        client.command_contexts.create.return_value = context_id
+        packages = ["pandas", "numpy==1.24.0", "scikit-learn>=1.0"]
+        submitter = PythonCommandSubmitter(client, tracker, cluster_id, packages)
+
+        command_exec = client.commands.execute.return_value
+        submitter.submit(compiled_code)
+
+        # Verify the code includes the pip install command
+        expected_code = "%pip install pandas numpy==1.24.0 scikit-learn>=1.0\n\ncompiled_code"
+        client.commands.execute.assert_called_once_with(cluster_id, context_id, expected_code)
+        client.commands.poll_for_completion.assert_called_once_with(command_exec)
+        tracker.remove_command.assert_called_once_with(command_exec)
+
+    def test_submit__with_empty_packages(
+        self, client, tracker, cluster_id, context_id, compiled_code
+    ):
+        client.command_contexts.create.return_value = context_id
+        submitter = PythonCommandSubmitter(client, tracker, cluster_id, [])
+
+        command_exec = client.commands.execute.return_value
+        submitter.submit(compiled_code)
+
+        # Verify the code is unchanged
+        client.commands.execute.assert_called_once_with(cluster_id, context_id, compiled_code)
+        client.commands.poll_for_completion.assert_called_once_with(command_exec)
+
 
 class TestPythonNotebookSubmitter:
     @pytest.fixture

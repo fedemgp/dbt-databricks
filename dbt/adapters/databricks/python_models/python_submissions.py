@@ -63,21 +63,41 @@ class PythonCommandSubmitter(PythonSubmitter):
     """Submitter for Python models using the Command API."""
 
     def __init__(
-        self, api_client: DatabricksApiClient, tracker: PythonRunTracker, cluster_id: str
+        self,
+        api_client: DatabricksApiClient,
+        tracker: PythonRunTracker,
+        cluster_id: str,
+        packages: Optional[list[str]] = None,
     ) -> None:
         self.api_client = api_client
         self.tracker = tracker
         self.cluster_id = cluster_id
+        self.packages = packages or []
+
+    def _prepare_code_with_packages(self, compiled_code: str) -> str:
+        """Prepend notebook-scoped package installation commands to the compiled code."""
+        if not self.packages:
+            return compiled_code
+
+        # Build the %pip install command for notebook-scoped packages
+        pip_install_cmd = "%pip install " + " ".join(self.packages)
+        logger.debug(f"Adding notebook-scoped package installation: {pip_install_cmd}")
+
+        # Prepend the pip install command to the compiled code
+        return f"{pip_install_cmd}\n\n{compiled_code}"
 
     @override
     def submit(self, compiled_code: str) -> None:
         logger.debug("Submitting Python model using the Command API.")
 
+        # Prepare code with notebook-scoped package installation if needed
+        code_to_execute = self._prepare_code_with_packages(compiled_code)
+
         context_id = self.api_client.command_contexts.create(self.cluster_id)
         command_exec: Optional[CommandExecution] = None
         try:
             command_exec = self.api_client.commands.execute(
-                self.cluster_id, context_id, compiled_code
+                self.cluster_id, context_id, code_to_execute
             )
 
             self.tracker.insert_command(command_exec)
@@ -103,6 +123,21 @@ class PythonNotebookUploader:
             else {}
         )
         self.notebook_access_control_list = parsed_model.config.notebook_access_control_list
+        self.packages = (
+            parsed_model.config.packages if parsed_model.config.notebook_scoped_libraries else []
+        )
+
+    def _prepare_code_with_packages(self, compiled_code: str) -> str:
+        """Prepend notebook-scoped package installation commands to the compiled code."""
+        if not self.packages:
+            return compiled_code
+
+        # Build the %pip install command for notebook-scoped packages
+        pip_install_cmd = "%pip install " + " ".join(self.packages)
+        logger.debug(f"Adding notebook-scoped package installation: {pip_install_cmd}")
+
+        # Prepend the pip install command to the compiled code
+        return f"{pip_install_cmd}\n\n# COMMAND ----------\n{compiled_code}"
 
     def upload(self, compiled_code: str) -> str:
         """Upload the compiled code to the Databricks workspace."""
@@ -114,10 +149,15 @@ class PythonNotebookUploader:
         file_path = f"{workdir}{self.identifier}"
         logger.debug(f"[Notebook Upload Debug] Uploading notebook to path: {file_path}")
 
-        # Log notebook content length
-        logger.debug(f"[Notebook Upload Debug] Notebook content length: {len(compiled_code)} chars")
+        # Prepare code with notebook-scoped package installation if needed
+        code_to_upload = self._prepare_code_with_packages(compiled_code)
 
-        self.api_client.workspace.upload_notebook(file_path, compiled_code)
+        # Log notebook content length
+        logger.debug(
+            f"[Notebook Upload Debug] Notebook content length: {len(code_to_upload)} chars"
+        )
+
+        self.api_client.workspace.upload_notebook(file_path, code_to_upload)
         logger.debug(f"[Notebook Upload Debug] Successfully uploaded notebook to {file_path}")
 
         if self.job_grants or self.notebook_access_control_list:
@@ -252,16 +292,24 @@ def get_library_config(
     packages: list[str],
     index_url: Optional[str],
     additional_libraries: list[dict[str, Any]],
+    notebook_scoped_libraries: bool = False,
 ) -> dict[str, Any]:
-    """Update the job configuration with the required libraries."""
+    """
+    Update the job configuration with the required libraries.
+
+    If notebook_scoped_libraries is True, packages are not included in the library config
+    as they will be installed via %pip install in the notebook itself.
+    """
 
     libraries = []
 
-    for package in packages:
-        if index_url:
-            libraries.append({"pypi": {"package": package, "repo": index_url}})
-        else:
-            libraries.append({"pypi": {"package": package}})
+    # Only add packages to cluster-level libraries if not using notebook-scoped
+    if not notebook_scoped_libraries:
+        for package in packages:
+            if index_url:
+                libraries.append({"pypi": {"package": package, "repo": index_url}})
+            else:
+                libraries.append({"pypi": {"package": package}})
 
     for library in additional_libraries:
         libraries.append(library)
@@ -286,7 +334,10 @@ class PythonJobConfigCompiler:
         packages = parsed_model.config.packages
         index_url = parsed_model.config.index_url
         additional_libraries = parsed_model.config.additional_libs
-        library_config = get_library_config(packages, index_url, additional_libraries)
+        notebook_scoped_libraries = parsed_model.config.notebook_scoped_libraries
+        library_config = get_library_config(
+            packages, index_url, additional_libraries, notebook_scoped_libraries
+        )
         self.cluster_spec = {**cluster_spec, **library_config}
         self.job_grants = parsed_model.config.python_job_config.grants
         self.additional_job_settings = parsed_model.config.python_job_config.dict()
@@ -444,7 +495,12 @@ class AllPurposeClusterPythonJobHelper(BaseDatabricksHelper):
                 {"existing_cluster_id": self.cluster_id},
             )
         else:
-            return PythonCommandSubmitter(self.api_client, self.tracker, self.cluster_id or "")
+            return PythonCommandSubmitter(
+                self.api_client,
+                self.tracker,
+                self.cluster_id or "",
+                self.parsed_model.config.packages,
+            )
 
     @override
     def validate_config(self) -> None:

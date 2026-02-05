@@ -42,6 +42,7 @@ class PythonModelConfig(BaseModel):
     cluster_id: Optional[str] = None
     http_path: Optional[str] = None
     create_notebook: bool = False
+    notebook_scoped_libraries: bool = False
     environment_key: Optional[str] = None
     environment_dependencies: list[str] = Field(default_factory=list)
 
